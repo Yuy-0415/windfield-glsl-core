@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>WebGL2 Wind Field — packed RGBA8 + 16-tap bicubic</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070c;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:fixed;left:14px;top:12px;color:#8fa6c8;font:12px/1.6 ui-monospace,Menlo,monospace;
+       background:rgba(6,10,18,.6);padding:10px 12px;border:1px solid #1b2637;border-radius:8px}
+  #hud b{color:#4f8cff}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <b>WebGL2 wind field</b><br/>
+  packed RGBA8 U/V · 16-tap Catmull-Rom bicubic<br/>
+  <span id="fps">–</span>
+</div>
+<script>
+const cvs = document.getElementById('c');
+const gl = cvs.getContext('webgl2', {antialias:false});
+if (!gl) { document.getElementById('hud').textContent = 'WebGL2 not available'; throw 0; }
+
+const VS = `#version 300 es
+in vec2 aPos; void main(){ gl_Position = vec4(aPos,0.0,1.0); }`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uWindTex;
+uniform vec2  uTexSize;
+uniform float uTime;
+out vec4 fragColor;
+
+vec2 decodeUV(vec4 t){
+  float u = (t.r*255.0*256.0 + t.g*255.0)/65535.0;
+  float v = (t.b*255.0*256.0 + t.a*255.0)/65535.0;
+  return vec2(u,v)*2.0-1.0;
+}
+vec4 crW(float t){ float t2=t*t,t3=t2*t;
+  return vec4(-0.5*t3+t2-0.5*t, 1.5*t3-2.5*t2+1.0, -1.5*t3+2.0*t2+0.5*t, 0.5*t3-0.5*t2); }
+vec2 bicubicWind(sampler2D tex, vec2 uv, vec2 ts){
+  vec2 st=uv*ts-0.5; vec2 f=fract(st); vec2 b=floor(st);
+  vec4 wx=crW(f.x), wy=crW(f.y); vec2 acc=vec2(0.0);
+  for(int j=0;j<4;++j) for(int i=0;i<4;++i){
+    vec2 c=(b+vec2(float(i-1),float(j-1))+0.5)/ts;
+    acc += decodeUV(texture(tex,c)) * wx[i] * wy[j];
+  }
+  return acc;
+}
+void main(){
+  vec2 uv = gl_FragCoord.xy / vec2(1024.0,768.0);
+  vec2 w = bicubicWind(uWindTex, uv, uTexSize);
+  float spd = length(w);
+  float ang = atan(w.y, w.x);
+  // wind speed -> colormap, direction -> hue shift
+  vec3 col = vec3(0.02,0.05,0.12);
+  col += vec3(0.15,0.45,0.95) * smoothstep(0.0,0.9,spd);
+  col += vec3(0.9,0.75,0.25) * smoothstep(0.55,1.4,spd);
+  col += vec3(1.0,0.35,0.2) * smoothstep(1.2,2.0,spd);
+  col *= 0.85 + 0.15*sin(ang*3.0 + uTime*0.6);
+  // subtle grid
+  vec2 g = abs(fract(uv*vec2(40.0,30.0))-0.5);
+  col += vec3(0.04) * smoothstep(0.48,0.5,max(g.x,g.y));
+  fragColor = vec4(col,1.0);
+}`;
+
+function sh(type, src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog,'aPos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,0,0);
+
+// ---- 程序化生成一张 1440x721 的风场，按 RGBA8 高低位打包 ----
+const W = 1440, H = 721;
+const data = new Uint8Array(W*H*4);
+function pack(v){ // v in [-1,1] -> 16bit
+  const q = Math.max(0, Math.min(65535, Math.round((v*0.5+0.5)*65535)));
+  return [q>>8, q&255];
+}
+for (let y=0;y<H;y++){
+  for (let x=0;x<W;x++){
+    const u = x/W*Math.PI*4, v = y/H*Math.PI*2;
+    let wx = Math.sin(u)*Math.cos(v*0.7) + 0.5*Math.sin(u*2.3+v);
+    let wy = Math.cos(v)*Math.sin(u*0.6) + 0.5*Math.cos(v*3.1-u);
+    wx = Math.tanh(wx)*1.6; wy = Math.tanh(wy)*1.6;
+    const [uh,ul] = pack(wx), [vh,vl] = pack(wy);
+    const i = (y*W+x)*4;
+    data[i]=uh; data[i+1]=ul; data[i+2]=vh; data[i+3]=vl;
+  }
+}
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,W,H,0,gl.RGBA,gl.UNSIGNED_BYTE,data);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.uniform1i(gl.getUniformLocation(prog,'uWindTex'), 0);
+gl.uniform2f(gl.getUniformLocation(prog,'uTexSize'), W, H);
+
+let last = performance.now(), frames = 0, acc = 0;
+function resize(){ const dpr = Math.min(devicePixelRatio||1, 2);
+  cvs.width = innerWidth*dpr; cvs.height = innerHeight*dpr; gl.viewport(0,0,cvs.width,cvs.height); }
+addEventListener('resize', resize); resize();
+
+function loop(t){
+  const dt = t - last; last = t; frames++; acc += dt;
+  if (acc > 500){ document.getElementById('fps').textContent = (frames*1000/acc).toFixed(0) + ' fps · ' + W + 'x' + H + ' grid'; frames=0; acc=0; }
+  gl.uniform1f(gl.getUniformLocation(prog,'uTime'), t*0.001);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
